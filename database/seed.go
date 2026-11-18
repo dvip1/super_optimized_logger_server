@@ -16,7 +16,7 @@ var schema = []string{
 		latitude INTEGER,
 		email TEXT NOT NULL,
 		FOREIGN KEY (email)
-		REFRENCES users(email)
+		REFERENCES users(email)
 		ON DELETE CASCADE
 	)	`,
 	`
@@ -38,7 +38,7 @@ var schema = []string{
 		token BLOB, 
 		name TEXT, 
 		
-		UNIQUE(name, email)
+		UNIQUE(name, email),
 
 		FOREIGN KEY (email)
 		REFERENCES users(email)

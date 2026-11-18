@@ -8,6 +8,8 @@ func Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /{$}", Hello)
+	mux.HandleFunc("POST /register", Register)
+	mux.HandleFunc("POST /login", Login)
 
 	// Add your routes here, e.g.:
 	// mux.HandleFunc("POST /users", CreateUser)

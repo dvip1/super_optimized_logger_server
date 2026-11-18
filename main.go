@@ -14,6 +14,9 @@ func main() {
 		log.Fatal("Error initializing database:", err)
 	}
 	defer database.Close()
+	if err := database.Seed(); err != nil {
+		log.Fatal("Error seeding database:", err)
+	}
 
 	fmt.Println("Server listening on :3002")
 	if err := http.ListenAndServe(":3002", handler.Routes()); err != nil {
