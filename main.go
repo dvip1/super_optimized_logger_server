@@ -6,11 +6,8 @@ import (
 	"net/http"
 
 	"dvip1/logger_server/database"
+	"dvip1/logger_server/handler"
 )
-
-func helloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello, world!")
-}
 
 func main() {
 	if err := database.Init("logger.db"); err != nil {
@@ -18,9 +15,8 @@ func main() {
 	}
 	defer database.Close()
 
-	http.HandleFunc("/", helloHandler)
 	fmt.Println("Server listening on :3002")
-	if err := http.ListenAndServe(":3002", nil); err != nil {
+	if err := http.ListenAndServe(":3002", handler.Routes()); err != nil {
 		fmt.Println("Error starting server:", err)
 	}
 }
