@@ -9,12 +9,14 @@ var schema = []string{
 		password       TEXT NOT NULL,
 		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	)`,
-	` CREATE TABLE IF NOT EXISTS devices(
+	`CREATE TABLE IF NOT EXISTS devices(
 		srno  TEXT PRIMARY KEY,
 		device_name TEXT, 
-		longitude INTEGER, 
-		latitude INTEGER,
+		longitude REAL, 
+		latitude REAL,
 		email TEXT NOT NULL,
+		encryption_key BLOB NOT NULL, 
+
 		FOREIGN KEY (email)
 		REFERENCES users(email)
 		ON DELETE CASCADE
@@ -34,7 +36,8 @@ var schema = []string{
 	  `,
 	  `
 	  CREATE TABLE IF NOT EXISTS token_device(
-	 	email TEXT PRIMARY KEY NOT NULL, 
+	 	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	 	email TEXT NOT NULL,
 		token BLOB, 
 		name TEXT, 
 		

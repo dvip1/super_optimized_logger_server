@@ -2,19 +2,19 @@ package handler
 
 import "net/http"
 
-// Routes registers every endpoint and returns the router.
-// Patterns use Go's built-in router: "METHOD /path/{param}".
+const BasePath = "/api/v1"
+
 func Routes() *http.ServeMux {
+	api := http.NewServeMux()
+
+	api.HandleFunc("GET /{$}", Hello)
+	api.HandleFunc("POST /register", Register)
+	api.HandleFunc("POST /login", Login)
+	
+
+	// api.HandleFunc("POST /devices/{srno}/logs", AddDeviceLog)
+
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /{$}", Hello)
-	mux.HandleFunc("POST /register", Register)
-	mux.HandleFunc("POST /login", Login)
-
-	// Add your routes here, e.g.:
-	// mux.HandleFunc("POST /users", CreateUser)
-	// mux.HandleFunc("GET /devices/{srno}", GetDevice)
-	// mux.HandleFunc("POST /devices/{srno}/logs", AddDeviceLog)
-
+	mux.Handle(BasePath+"/", http.StripPrefix(BasePath, api))
 	return mux
 }
