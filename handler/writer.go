@@ -1,49 +1,84 @@
 package handler
 
 import (
+	"encoding/binary"
+	"log"
 	"time"
-
-	"dvip1/logger_server/database"
 )
 
-// flushInterval is how often queued readings are committed. Shorter = lower
-// ingest latency; longer = bigger, cheaper transactions.
-const flushInterval = 20 * time.Millisecond
+const (
+	epoch   = 60 * time.Second // rotate + compact at least this often under load
+	idleGap = 5 * time.Second  // ...or once ingest has been quiet this long
+)
 
-// pendingRow is one decrypted reading waiting for the next commit.
+// pendingRow is one decrypted reading waiting to be written.
 type pendingRow struct {
-	dev     *device    // whose `latest` to advance after the commit
+	dev     *device    // whose buffer and `latest` to update after the write
 	srno    []byte     // 8 bytes
 	ts      int64      // Unix seconds
 	sensors []byte     // 256 bytes: 64 little-endian float32
-	done    chan error // receives the commit result; buffered so the writer never blocks
+	done    chan error // receives the write result; buffered so the writer never blocks
 }
 
 // writeQueue carries readings from the data handlers to the writer goroutine.
 // When full, handlers block on send, which slows ingest instead of losing data.
 var writeQueue = make(chan pendingRow, 1<<16)
 
-// StartWriter starts the group-commit loop: one transaction per flushInterval
-// for every reading queued since the last one.
-func StartWriter() {
-	go func() {
-		var batch []pendingRow
-		for range time.Tick(flushInterval) {
-			batch = drainQueue(batch[:0])
-			if len(batch) == 0 {
-				continue
+// StartWriter opens a fresh segment and starts the writer goroutine.
+func StartWriter() error {
+	seg, err := openSegment()
+	if err != nil {
+		return err
+	}
+	go writeLoop(seg)
+	return nil
+}
+
+// writeLoop is the only goroutine that appends to segments and device buffers.
+// Commit-when-ready: it waits for one reading, takes everything else already
+// queued, writes them with ONE write() and answers them all. Under load the
+// batches grow by themselves; there is no timer to wait for.
+func writeLoop(seg *segment) {
+	var batch []pendingRow
+	var out []byte
+	dirty := true // compact once after start too: picks up replayed readings, removes old segments
+	segStart, lastWrite := time.Now(), time.Now()
+	tick := time.NewTicker(time.Second)
+
+	for {
+		select {
+		case row := <-writeQueue:
+			batch = drainQueue(append(batch[:0], row))
+			out = out[:0]
+			for _, r := range batch { // segment record: srno | ts | sensors
+				out = append(out, r.srno...)
+				out = binary.LittleEndian.AppendUint64(out, uint64(r.ts))
+				out = append(out, r.sensors...)
 			}
-			err := insertBatch(batch)
-			for _, row := range batch {
+			err := seg.append(out)
+			for i, r := range batch {
 				if err == nil {
-					// Before replying: once the device sees 2xx, /latest
-					// must already return this reading.
-					row.dev.setLatest(row.ts, row.sensors)
+					// Before replying: once the device sees 2xx, /latest and
+					// /readings must already return this reading.
+					r.dev.addReading(out[i*segRecSize+8 : (i+1)*segRecSize])
+					r.dev.setLatest(r.ts, r.sensors)
 				}
-				row.done <- err // the handler answers 2xx only if err == nil
+				r.done <- err // the handler answers 2xx only if err == nil
+			}
+			dirty, lastWrite = true, time.Now()
+
+		case now := <-tick.C:
+			due := now.Sub(segStart) >= epoch || now.Sub(lastWrite) >= idleGap
+			if dirty && due && !compacting.Load() {
+				next, err := rotate(seg)
+				if err != nil {
+					log.Println("rotate:", err) // keep writing to the old segment, retry next tick
+					continue
+				}
+				seg, segStart, dirty = next, now, false
 			}
 		}
-	}()
+	}
 }
 
 // drainQueue appends everything currently in writeQueue to batch, without waiting.
@@ -56,24 +91,4 @@ func drainQueue(batch []pendingRow) []pendingRow {
 			return batch
 		}
 	}
-}
-
-// insertBatch writes all rows in one transaction: all of them land, or none do.
-func insertBatch(batch []pendingRow) error {
-	tx, err := database.DB.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() // no-op after a successful Commit
-
-	stmt, err := tx.Prepare(`INSERT INTO ingest_log (srno, ts, sensors) VALUES (?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	for _, row := range batch {
-		if _, err := stmt.Exec(row.srno, row.ts, row.sensors); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
 }

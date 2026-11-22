@@ -1,11 +1,15 @@
 package handler
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"math"
 	"net/http"
 	"strconv"
+
+	"dvip1/logger_server/database"
 )
 
 const maxLimit = 1000 // largest `limit` the spec allows for /readings
@@ -29,22 +33,38 @@ func ownedDevice(w http.ResponseWriter, r *http.Request, email string) ([]byte, 
 	return nil, nil
 }
 
-// Latest serves the device's newest committed reading from memory.
+// Latest serves the device's newest reading: from memory, or after a restart
+// (before the device sends again) from its newest block.
 func Latest(w http.ResponseWriter, r *http.Request, email string) {
-	_, d := ownedDevice(w, r, email)
+	srno, d := ownedDevice(w, r, email)
 	if d == nil {
 		return
 	}
-	latest := d.latest.Load()
-	if latest == nil {
+	if latest := d.latest.Load(); latest != nil {
+		writeRawJSON(w, appendReading(nil, latest.ts, latest.sensors[:]))
+		return
+	}
+	var data []byte
+	err := database.DB.QueryRow(
+		`SELECT data FROM reading_blocks WHERE srno = ? ORDER BY end_ts DESC LIMIT 1`, srno,
+	).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "no readings yet")
 		return
 	}
-	writeRawJSON(w, appendReading(nil, latest.ts, latest.sensors[:]))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	recs := decodeBlock(data)
+	last := recs[len(recs)-recSize:]
+	writeRawJSON(w, appendReading(nil, recTs(last), last[8:]))
 }
 
 // Readings serves readings with from <= timestamp <= to, oldest first, at most limit.
-// TODO(compaction): read reading_blocks + the in-memory buffer instead of ingest_log.
+// Older readings come from reading_blocks, newer ones from the device's buffer;
+// the watermark splits them, so none is returned twice or missed while a
+// compaction moves readings from the buffer into a block.
 func Readings(w http.ResponseWriter, r *http.Request, email string) {
 	srno, d := ownedDevice(w, r, email)
 	if d == nil {
@@ -57,36 +77,51 @@ func Readings(w http.ResponseWriter, r *http.Request, email string) {
 	if s := q.Get("limit"); s != "" {
 		limit, errLimit = strconv.ParseInt(s, 10, 64)
 	}
-	// limit <= 0 must be rejected: SQLite treats a negative LIMIT as "no limit".
 	if errFrom != nil || errTo != nil || errLimit != nil || limit <= 0 {
 		writeError(w, http.StatusBadRequest, "from and to (Unix seconds) required, limit must be positive")
 		return
 	}
 	limit = min(limit, maxLimit)
 
+	// Snapshot buffer + watermark together. A block committed after this
+	// snapshot only holds readings > wm, which are in the snapshot already.
+	d.bufMu.Lock()
+	wm, recent := d.wm, bytes.Clone(d.buf)
+	d.bufMu.Unlock()
+
 	body := []byte(`{"readings":[`)
-	first := true
-	err := eachRow(
-		`SELECT ts, sensors FROM ingest_log WHERE srno = ? AND ts BETWEEN ? AND ? ORDER BY ts LIMIT ?`,
-		func(rows *sql.Rows) error {
-			var ts int64
-			var sensors []byte
-			if err := rows.Scan(&ts, &sensors); err != nil {
-				return err
+	n := int64(0)
+	// add appends the records (ts | sensors) in [from, to] until limit is reached.
+	add := func(recs []byte) {
+		for i := 0; i < len(recs) && n < limit; i += recSize {
+			if ts := recTs(recs[i:]); ts >= from && ts <= to {
+				if n > 0 {
+					body = append(body, ',')
+				}
+				body = appendReading(body, ts, recs[i+8:i+recSize])
+				n++
 			}
-			if !first {
-				body = append(body, ',')
-			}
-			first = false
-			body = appendReading(body, ts, sensors)
-			return nil
-		},
-		srno, from, to, limit, // srno as []byte: the column is a BLOB; a string would never match
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
-		return
+		}
 	}
+	if from <= wm {
+		err := eachRow(
+			`SELECT data FROM reading_blocks WHERE srno = ? AND end_ts >= ? AND start_ts <= ? ORDER BY end_ts`,
+			func(rows *sql.Rows) error {
+				var data []byte
+				if err := rows.Scan(&data); err != nil {
+					return err
+				}
+				add(decodeBlock(data))
+				return nil
+			},
+			srno, from, min(to, wm), // srno as []byte: the column is a BLOB
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "database error")
+			return
+		}
+	}
+	add(recent)
 	writeRawJSON(w, append(body, "]}"...))
 }
 

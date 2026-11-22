@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 )
@@ -17,9 +18,36 @@ type device struct {
 	email   string      // owner; only this user may read the device
 	lastTs  int64       // newest accepted timestamp (replay protection)
 
+	// Readings not yet compacted. Own lock, separate from mu: the data handler
+	// holds mu while it enqueues, so the writer must never wait on mu.
+	bufMu sync.Mutex
+	buf   []byte // records ts (8) | sensors (256), oldest first, all with ts > wm
+	wm    int64  // watermark: readings with ts <= wm are in reading_blocks
+
 	// latest is the newest COMMITTED reading, served by /latest. Atomic so
 	// readers never wait on mu (register holds mu during a SQLite write).
 	latest atomic.Pointer[reading]
+}
+
+// recSize is one buffered reading: ts int64 | 64 x float32, little-endian.
+const recSize = 8 + sensorBytes
+
+func recTs(rec []byte) int64 { return int64(binary.LittleEndian.Uint64(rec)) }
+
+// addReading appends one record (ts | sensors). Only the writer calls it.
+func (d *device) addReading(rec []byte) {
+	d.bufMu.Lock()
+	d.buf = append(d.buf, rec...)
+	d.bufMu.Unlock()
+}
+
+// trim drops the first n records once they are committed in a block ending at end.
+func (d *device) trim(n int, end int64) {
+	d.bufMu.Lock()
+	k := copy(d.buf, d.buf[n*recSize:]) // shift in place, keeps the allocation
+	d.buf = d.buf[:k]
+	d.wm = end
+	d.bufMu.Unlock()
 }
 
 // reading is one stored reading: timestamp + 64 raw little-endian float32.
@@ -88,8 +116,7 @@ func markRevoked(tokenID int64) {
 
 // LoadDevices fills the cache from SQLite. Call once at startup, before serving.
 // Runs single-threaded, so it touches the maps and devices without locks.
-// Every query is one pass over its table (no per-device subqueries), so restart
-// time stays flat with 20k devices even without the ingest_log index.
+// Every query is one pass over a table or index (no per-device subqueries).
 func LoadDevices() error {
 	err := eachRow(`SELECT id FROM token_device WHERE revoked = 1`, func(rows *sql.Rows) error {
 		var id int64
@@ -115,10 +142,9 @@ func LoadDevices() error {
 		return err
 	}
 
-	// lastTs = newest reading in either storage tier, so a replay of a
-	// pre-crash packet is still rejected after a restart.
-	// TODO(compaction): also restore `latest` from the newest block (or keep
-	// each device's newest row in ingest_log when compacting).
+	// Watermark = end of the newest block; replay then restores everything
+	// newer from the segments. lastTs follows, so a replay of a pre-crash
+	// packet is still rejected after a restart. Uses only the (srno, end_ts) index.
 	err = eachRow(`SELECT srno, MAX(end_ts) FROM reading_blocks GROUP BY srno`, func(rows *sql.Rows) error {
 		var srno []byte
 		var ts int64
@@ -126,26 +152,12 @@ func LoadDevices() error {
 			return err
 		}
 		if d := devices[[8]byte(srno)]; d != nil {
-			d.lastTs = max(d.lastTs, ts)
+			d.wm, d.lastTs = ts, ts
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-
-	// With MAX(), SQLite takes the other columns (sensors) from the max row,
-	// so this restores lastTs and the latest reading in one pass.
-	return eachRow(`SELECT srno, MAX(ts), sensors FROM ingest_log GROUP BY srno`, func(rows *sql.Rows) error {
-		var srno, sensors []byte
-		var ts int64
-		if err := rows.Scan(&srno, &ts, &sensors); err != nil {
-			return err
-		}
-		if d := devices[[8]byte(srno)]; d != nil {
-			d.lastTs = max(d.lastTs, ts)
-			d.setLatest(ts, sensors)
-		}
-		return nil
-	})
+	return replaySegments()
 }

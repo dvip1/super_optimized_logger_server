@@ -65,11 +65,13 @@ func IngestData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d.lastTs = ts // only now: rejected packets never move lastTs
-	d.mu.Unlock()
 
-	// Hand the reading to the group-commit writer and wait for its commit.
+	// Hand the reading to the writer, still under the lock: this device's
+	// readings then reach the writer (and its buffer) in timestamp order.
 	done := make(chan error, 1)
 	writeQueue <- pendingRow{dev: d, srno: packet[1:aadEnd], ts: ts, sensors: plain[8 : 8+sensorBytes], done: done}
+	d.mu.Unlock()
+	// Wait until the reading is written to the segment file.
 	if err := <-done; err != nil {
 		writeError(w, http.StatusInternalServerError, "could not store reading")
 		return
