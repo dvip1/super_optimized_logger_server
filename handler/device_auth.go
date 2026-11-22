@@ -13,9 +13,8 @@ type registerDeviceRequest struct {
 	Srno       string  `json:"srno"`  // 16 hex chars -> 8 bytes
 	Token      string  `json:"token"` // 32 hex chars -> 16 bytes
 	DeviceName string  `json:"device_name"`
-	Location   string  `json:"location"`
-	Longitude  float64 `json:"longitude"`
-	Latitude   float64 `json:"latitude"`
+	Latitude   float64 `json:"latitude"`  // decimal degrees, [-90, 90]
+	Longitude  float64 `json:"longitude"` // decimal degrees, [-180, 180]
 }
 
 func RegisterDevice(w http.ResponseWriter, r *http.Request) {
