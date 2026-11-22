@@ -11,8 +11,8 @@ func Routes() *http.ServeMux {
 	api.HandleFunc("POST /register", Register)
 	api.HandleFunc("POST /login", Login)
 	api.HandleFunc("POST /logger/register", RegisterDevice)
-
-	// api.HandleFunc("POST /devices/{srno}/logs", AddDeviceLog)
+	api.HandleFunc("POST /tokens", requireAuth(CreateToken))
+	api.HandleFunc("DELETE /tokens/{id}", requireAuth(RevokeToken))
 
 	mux := http.NewServeMux()
 	mux.Handle(BasePath+"/", http.StripPrefix(BasePath, api))

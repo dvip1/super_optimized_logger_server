@@ -55,5 +55,10 @@ func Login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"email": req.Email})
+	token, err := issueToken(req.Email)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not issue token")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"access_token": token})
 }

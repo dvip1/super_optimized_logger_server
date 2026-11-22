@@ -4,13 +4,21 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"dvip1/logger_server/database"
 	"dvip1/logger_server/handler"
 )
 
 func main() {
-	if err := database.Init("logger.db"); err != nil {
+	// All persistent state lives in ./data (challenge rule 2).
+	if err := os.MkdirAll("data", 0o700); err != nil {
+		log.Fatal("Error creating data dir:", err)
+	}
+	if err := handler.InitAuth("data/jwt.key"); err != nil {
+		log.Fatal("Error loading auth key:", err)
+	}
+	if err := database.Init("data/logger.db"); err != nil {
 		log.Fatal("Error initializing database:", err)
 	}
 	defer database.Close()
