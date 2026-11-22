@@ -1,93 +1,79 @@
-## Phase 1: Skeleton & Conformance (The "Hello World" phase)
+# Logger Platform Architecture
 
-*Goal: Get the server running, create the database, and pass the fast conformance checks.*
+## 1. Environment & Constraints
+- **Host:** Single AWS Lightsail instance (2 vCPU, 2 GB RAM, 60 GB SSD, Ubuntu 24.04).
+- **State:** All persistent state stored in `./data` (SQLite database + auth signing secret if using JWT).
+- **Durability Model:** `kill -9` safe via Linux kernel page cache (`synchronous = OFF` in WAL mode) paired with group commit.
 
-* **Setup the Project:** Initialize a standard Go module. Use the standard library `net/http` for routing (Go 1.22+ has excellent built-in routing) to avoid heavy frameworks. Add `[github.com/mattn/go-sqlite3](https://github.com/mattn/go-sqlite3)` (or `modernc.org/sqlite` for pure Go).
-* **Implement the Database Schema:**
-* Create the `readings` table with `WITHOUT ROWID` and `PRIMARY KEY (srno, ts)`.
-* Create a `devices` table to map `srno` to `token`, `owner_id`, and `aes_key`.
-* Create tables for `users` and `tokens`.
+---
 
+## 2. SQLite Configuration (PRAGMAs)
+Applied on every database connection:
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = OFF;
+PRAGMA foreign_keys = ON;
+```
 
-* **Build the Control Plane (Auth & Tokens):**
-* Implement `/signup`, `/login`, and `/tokens`.
-* Use a simple signed JWT or a random string stored in SQLite for the `access_token`.
+---
 
+## 3. Database Schema
 
-* **Build Mock Device Endpoints:**
-* Implement `/health` (just return `200 OK`).
-* Implement `/register` (generate the AES key, save to DB, return it).
-* Implement a dummy `/data` that just returns `200 OK` (we will build the real one in Phase 2).
+checkout /database/seed.go
 
+---
 
-* **Milestone Test:** Run `go run . -url http://localhost:8080 -devices 0`. Do not move to Phase 2 until this passes.
+## 4. In-Memory State (Ingest Hot Path)
+SQL queries are kept off the per-packet ingest path using in-memory structures synced with SQLite:
 
-## Phase 2: The Core Engine (Ingest & Group Commit)
+- **Device Cache:** `map[[8]byte]*DeviceState`
+  - `cipher.AEAD` (pre-initialized AES-128-GCM cipher)
+  - `token_id`, `email` (owner)
+  - `last_ts` (for replay protection)
+  - `buffer` (slice of up to ~60 recent plaintext readings)
+- **Revoked Tokens Set:** `map[int64]struct{}`
+  - Updated synchronously in memory whenever `DELETE /api/v1/tokens/{id}` writes to SQLite.
 
-*Goal: Handle the massive write load safely without destroying the SSD or dropping data.*
+---
 
-* **Build the Hot-Path RAM Maps:**
-* Create a `map[string]*DeviceState` holding the AES key, owner, revoked status, and `lastTimestamp`.
-* Load this map from SQLite on boot. Updates to this map (like a new registration) must be protected by a `sync.RWMutex`.
+## 5. Core Data Flows
 
+### Device Registration (`POST /api/v1/logger/register`)
+1. Validate token (exists and not revoked).
+2. Generate random 16-byte AES-128 key.
+3. Upsert device in `devices` (updates `email`, `token_id`, and `encryption_key`; ownership transfer preserves history via `srno`).
+4. **Commit transaction before responding.**
+5. Update in-memory Device Cache with the new cipher and metadata.
+6. Return base64-encoded key.
 
-* **Implement the Group Commit Channel:**
-* Create a Go channel that accepts a struct containing the decrypted reading, the `srno`, and a `chan error` (the wait channel).
-* Create a single "Writer Goroutine" that reads from this channel. Have it collect items into a slice until it hits ~500 items *or* a 50ms timer ticks.
-* The Writer Goroutine starts a single SQLite transaction, executes `INSERT` for all items, commits, and then sends `nil` down all 500 wait channels.
+### Sensor Ingest (`POST /api/v1/logger/data`)
+1. Validate packet length (301 bytes) and version (`1`).
+2. Look up `srno` in the in-memory Device Cache and verify `token_id` is not in the Revoked Tokens Set.
+3. Decrypt payload using cached `cipher.AEAD` (AAD = bytes `0..8`).
+4. Check `ts <= last_ts` in memory; reject/drop replays immediately.
+5. Update `last_ts`, append plaintext reading to the device's in-memory buffer, and enqueue the row for the Tier 1 writer.
+6. **Group Commit:** Flush queued rows into `ingest_log` in a single transaction every **20–100 ms**. Hold HTTP `2xx` responses until their batch commits.
 
+### Compaction (Tier 1 → Tier 2)
+1. Triggered when a device's in-memory buffer reaches ~60 readings, or when a device has sent nothing for ~10 s (flushes partial buffers so no uncompressed rows linger in `ingest_log`).
+   - Runs on the group-commit goroutine, and only blocks readings whose `ingest_log` batch has already committed. Otherwise a later batch could insert rows already inside a block, duplicating them after a crash replay.
+2. Encode block:
+   - Transpose 60 × 64 `float32` values into sensor-major order.
+   - Apply Gorilla-style XOR encoding per sensor.
+   - Delta-encode timestamps.
+   - Compress with `zstd`.
+3. In a single transaction: insert block into `reading_blocks` and delete that device's flushed rows from `ingest_log`.
+4. Clear flushed readings from the device's in-memory buffer (keep the newest reading for `/latest`).
+5. When ingest goes quiet, run `PRAGMA wal_checkpoint(TRUNCATE)` so the WAL file doesn't inflate `./data`.
 
-* **Write the `/data` Handler:**
-* Use `sync.Pool` to allocate a 301-byte buffer to read the incoming HTTP body (prevents GC spikes).
-* Look up the device in the RAM map. Decrypt the AES-128-GCM payload.
-* Check if the timestamp is strictly greater than `lastTimestamp`.
-* Send the payload to the Group Commit channel and block on the wait channel. When the wait channel returns, send `200 OK`.
+### Read Queries (`/latest`, `/readings`)
+- Verify device ownership (`devices.email` matches authenticated user).
+- **`/latest`:** Serve directly from the device's in-memory buffer (fallback to latest `reading_blocks` row if empty).
+- **`/readings`:** Query matching ranges from `reading_blocks`, decompress, and merge with the device's in-memory buffer to guarantee `< 5s` visibility.
 
-
-* **Milestone Test:** Run a small live load: `go run . -url http://localhost:8080 -devices 500 -tokens <your_token>`.
-
-## Phase 3: The Read Path & Float Exactness
-
-*Goal: Serve data back flawlessly so the audit passes.*
-
-* **Build the `/latest` Handler:**
-* Create a second RAM map: `map[string][]byte` (or array of 64 floats) that stores the absolute latest reading per device.
-* Update this map inside your Group Commit writer just before it replies to the wait channels.
-* The `/latest` endpoint just reads from this map and formats the JSON. No DB lookup required.
-
-
-* **Build the `/readings` Handler:**
-* Query the SQLite `readings` table using `WHERE srno = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT ?`.
-* **Crucial Float Step:** Parse the 256-byte BLOB directly into an array of 64 `float32`s using `math.Float32frombits`.
-* Write a custom JSON encoder (or use `strconv.FormatFloat(float64(f), 'g', -1, 32)`) to ensure the floats are printed perfectly without floating-point expansion errors.
-
-
-* **Milestone Test (Crash Recovery):** Run load with 1,000 devices. In another terminal, run `kill -9 <pid>`. Restart the server. Ensure the judge outputs `PASS` for the audit.
-
-## Phase 4: Frontend & Dashboard
-
-*Goal: Build a UI that sets you apart from the terminal-only submissions.*
-
-* **Setup `embed.FS`:** Create a `static` folder with an `index.html`. Tell Go to embed this directory into the final binary and serve it on `/`.
-* **Design the SPA:** Use Vanilla JS, Preact, or Vue (no complex build step required if you use CDN links or pre-compiled files). Build the login screen, token generation, and a list of devices.
-* **Implement Live Updates (SSE):**
-* Create an endpoint like `/api/v1/stream`.
-* Use Server-Sent Events (SSE). Have your ingest engine fan out the `latest` readings to connected web clients once a second.
-* Plot the data using a lightweight charting library like uPlot or Chart.js.
-
-
-* **Milestone Test:** Create tokens in your own UI. Run the judge in "load only" mode: `go run . -devices 1000 -tokens <token1>,<token2>`. Watch your dashboard light up.
-
-## Phase 5: Scale, Tune, & Benchmark
-
-*Goal: Squeeze every ounce of performance out of the 2 vCPUs.*
-
-* **Run the Profiler:** Add `net/http/pprof` to your router. Run a heavy load test and look at the CPU profile. If Garbage Collection (GC) is taking more than 5% of your CPU, hunt down and pool your allocations.
-* **Tune SQLite Pragmas:** Ensure your startup routine executes:
-* `PRAGMA journal_mode = WAL;`
-* `PRAGMA synchronous = NORMAL;` (or `FULL` if you want to be ultra-safe, test both).
-* `PRAGMA temp_store = MEMORY;`
-
-
-* **Write the Setup Script:** Create a simple `install.sh` that installs Go, downloads your repo, builds the binary, and sets up a systemd service file so it restarts automatically on failure.
-* **Final Benchmark:** Run `go run . -url http://<server>:8080 -devices 5000 -duration 5m -crash-test` on the actual AWS Lightsail box. Note your metrics for the README.
+### Startup & Crash Recovery
+1. Open SQLite in `./data` and apply PRAGMAs.
+2. Load `devices` and revoked `token_device` rows into memory.
+3. Replay all remaining rows from `ingest_log` into per-device in-memory buffers.
+4. Restore each device's `last_ts` as the max of its newest `ingest_log.ts` and its newest `reading_blocks.end_ts` (a device whose buffer was just compacted has no `ingest_log` rows left).
+5. Start HTTP server and group-commit loop.

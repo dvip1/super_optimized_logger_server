@@ -11,7 +11,7 @@ import (
 var DB *sql.DB
 
 func Init(path string) error {
-	db, err := sql.Open("sqlite3", path+"?_foreign_keys=on&_journal_mode=WAL")
+	db, err := sql.Open("sqlite3", path+"?_foreign_keys=on&_journal_mode=WAL&_synchronous=OFF")
 	if err != nil {
 		return fmt.Errorf("open sqlite: %w", err)
 	}
