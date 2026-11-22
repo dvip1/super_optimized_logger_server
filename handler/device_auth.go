@@ -68,7 +68,8 @@ func RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	d.aead, d.tokenID = newAEAD(key), tokenID // the old key stops working here
+	// The old key stops working and the old owner loses access here.
+	d.aead, d.tokenID, d.email = newAEAD(key), tokenID, email
 
 	writeJSON(w, http.StatusOK, map[string]string{"key": base64.StdEncoding.EncodeToString(key)})
 }

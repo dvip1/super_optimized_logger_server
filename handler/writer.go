@@ -12,6 +12,7 @@ const flushInterval = 20 * time.Millisecond
 
 // pendingRow is one decrypted reading waiting for the next commit.
 type pendingRow struct {
+	dev     *device    // whose `latest` to advance after the commit
 	srno    []byte     // 8 bytes
 	ts      int64      // Unix seconds
 	sensors []byte     // 256 bytes: 64 little-endian float32
@@ -34,6 +35,11 @@ func StartWriter() {
 			}
 			err := insertBatch(batch)
 			for _, row := range batch {
+				if err == nil {
+					// Before replying: once the device sees 2xx, /latest
+					// must already return this reading.
+					row.dev.setLatest(row.ts, row.sensors)
+				}
 				row.done <- err // the handler answers 2xx only if err == nil
 			}
 		}

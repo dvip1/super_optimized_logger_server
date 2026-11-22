@@ -69,7 +69,7 @@ func IngestData(w http.ResponseWriter, r *http.Request) {
 
 	// Hand the reading to the group-commit writer and wait for its commit.
 	done := make(chan error, 1)
-	writeQueue <- pendingRow{srno: packet[1:aadEnd], ts: ts, sensors: plain[8 : 8+sensorBytes], done: done}
+	writeQueue <- pendingRow{dev: d, srno: packet[1:aadEnd], ts: ts, sensors: plain[8 : 8+sensorBytes], done: done}
 	if err := <-done; err != nil {
 		writeError(w, http.StatusInternalServerError, "could not store reading")
 		return
