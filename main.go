@@ -27,6 +27,10 @@ func main() {
 	if err := database.Seed(); err != nil {
 		log.Fatal("Error seeding database:", err)
 	}
+	if err := handler.LoadDevices(); err != nil {
+		log.Fatal("Error loading devices:", err)
+	}
+	handler.StartWriter()
 
 	fmt.Println("Server listening on", addr)
 	if err := http.ListenAndServe(addr, handler.Routes()); err != nil {

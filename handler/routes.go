@@ -12,6 +12,7 @@ func Routes() *http.ServeMux {
 	api.HandleFunc("POST /auth/login", Login)
 	api.HandleFunc("GET /logger/health", Health)
 	api.HandleFunc("POST /logger/register", RegisterDevice)
+	api.HandleFunc("POST /logger/data", IngestData)
 	api.HandleFunc("POST /tokens", requireAuth(CreateToken))
 	api.HandleFunc("DELETE /tokens/{id}", requireAuth(RevokeToken))
 

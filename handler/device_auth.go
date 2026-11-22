@@ -44,6 +44,13 @@ func RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Hold the device lock across the DB write and the cache update, so the
+	// key in SQLite and the key in memory can never disagree, and no packet is
+	// checked against a half-updated device.
+	d := getOrAddDevice([8]byte(srno))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	key := randomBytes(16)
 	_, err = database.DB.Exec(
 		`INSERT INTO devices (srno, device_name, longitude, latitude, email, token_id, encryption_key)
@@ -61,7 +68,7 @@ func RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	// TODO: refresh the in-memory device cache (cipher, token_id, email) here.
+	d.aead, d.tokenID = newAEAD(key), tokenID // the old key stops working here
 
 	writeJSON(w, http.StatusOK, map[string]string{"key": base64.StdEncoding.EncodeToString(key)})
 }

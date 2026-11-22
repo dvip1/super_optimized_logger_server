@@ -37,8 +37,13 @@ func CreateToken(w http.ResponseWriter, r *http.Request, email string) {
 
 // RevokeToken revokes one of the caller's tokens. Other users' tokens get 404.
 func RevokeToken(w http.ResponseWriter, r *http.Request, email string) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "token not found")
+		return
+	}
 	res, err := database.DB.Exec(
-		`UPDATE token_device SET revoked = 1 WHERE id = ? AND email = ?`, r.PathValue("id"), email,
+		`UPDATE token_device SET revoked = 1 WHERE id = ? AND email = ?`, id, email,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
@@ -48,6 +53,6 @@ func RevokeToken(w http.ResponseWriter, r *http.Request, email string) {
 		writeError(w, http.StatusNotFound, "token not found")
 		return
 	}
-	// TODO: add the id to the in-memory revoked-token set once ingest exists.
+	markRevoked(id) // data from this token's devices is rejected from now on
 	w.WriteHeader(http.StatusNoContent)
 }
