@@ -10,7 +10,7 @@ func Routes() *http.ServeMux {
 	api.HandleFunc("GET /{$}", Hello)
 	api.HandleFunc("POST /register", Register)
 	api.HandleFunc("POST /login", Login)
-	
+	api.HandleFunc("POST /logger/register", RegisterDevice)
 
 	// api.HandleFunc("POST /devices/{srno}/logs", AddDeviceLog)
 
